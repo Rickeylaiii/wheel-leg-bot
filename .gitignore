@@ -1,0 +1,6 @@
+.venv/
+.vscode/
+__pycache__/
+esp32.svd
+debug.cfg
+debug_custom.json
