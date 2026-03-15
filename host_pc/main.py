@@ -102,6 +102,14 @@ class TelemetryParser:
                 ),
             ),
             (
+                "openloop",
+                re.compile(r"OpenLoop Stage:(\d+)\s*\|\s*M1 Cmd:([-\d.]+)\s*\|\s*M2 Cmd:([-\d.]+)"),
+            ),
+            (
+                "manual_openloop",
+                re.compile(r"Manual(?:\s+Command\s+Applied)?\s+OpenLoop\s*\|\s*M1 Cmd:([-\d.]+)\s*\|\s*M2 Cmd:([-\d.]+)"),
+            ),
+            (
                 "test_start",
                 re.compile(r">>> Starting Test\s*(\d+)\s*<<<"),
             ),
@@ -216,6 +224,27 @@ class TelemetryParser:
                     text,
                 )
 
+            if kind == "openloop":
+                return TelemetryEvent(
+                    kind,
+                    {
+                        "stage": int(match.group(1)),
+                        "openloop_m1_cmd": float(match.group(2)),
+                        "openloop_m2_cmd": float(match.group(3)),
+                    },
+                    text,
+                )
+
+            if kind == "manual_openloop":
+                return TelemetryEvent(
+                    kind,
+                    {
+                        "openloop_m1_cmd": float(match.group(1)),
+                        "openloop_m2_cmd": float(match.group(2)),
+                    },
+                    text,
+                )
+
             if kind == "test_start":
                 return TelemetryEvent(kind, {"current_test": int(match.group(1))}, text)
 
@@ -310,6 +339,14 @@ class MainWindow(QMainWindow):
         "stage",
         "m1_target",
         "m2_target",
+        "openloop_m1_cmd",
+        "openloop_m2_cmd",
+        "manual_check_m1f",
+        "manual_check_m1r",
+        "manual_check_m2f",
+        "manual_check_m2r",
+        "manual_check_summary",
+        "last_manual_command",
         "foc_m1_result",
         "foc_m2_result",
         "foc_ready",
@@ -345,6 +382,21 @@ class MainWindow(QMainWindow):
         self.latest_line_label = QLabel("-")
         self.metric_labels: dict[str, QLabel] = {}
         self.curves: dict[str, Any] = {}
+        self.direction_check_combos: dict[str, QComboBox] = {}
+        self.direction_check_commands: dict[str, str] = {
+            "manual_check_m1f": "M1F",
+            "manual_check_m1r": "M1R",
+            "manual_check_m2f": "M2F",
+            "manual_check_m2r": "M2R",
+        }
+        self.direction_check_titles: dict[str, str] = {
+            "manual_check_m1f": "M1 正转",
+            "manual_check_m1r": "M1 反转",
+            "manual_check_m2f": "M2 正转",
+            "manual_check_m2r": "M2 反转",
+        }
+        self.manual_summary_label = QLabel("未开始")
+        self.last_manual_command_label = QLabel("-")
 
         self._build_ui()
         self._refresh_ports()
@@ -397,6 +449,8 @@ class MainWindow(QMainWindow):
             ("7 位置闭环", "7"),
             ("8 速度闭环", "8"),
             ("9 力矩扫描", "9"),
+            ("10 开环转动", "10"),
+            ("11 手动模式", "11"),
             ("H 帮助", "h"),
         ]
         for index, (title, command) in enumerate(button_specs):
@@ -406,9 +460,11 @@ class MainWindow(QMainWindow):
 
         custom_group = QGroupBox("自定义命令")
         custom_layout = QHBoxLayout(custom_group)
-        self.send_input.setPlaceholderText("例如: h 或 7")
+        self.send_input.setPlaceholderText("例如: h、10、11、M1F")
         custom_layout.addWidget(self.send_input)
         custom_layout.addWidget(self.send_button)
+
+        manual_group = self._build_manual_verification_group()
 
         record_group = QGroupBox("录制")
         record_layout = QHBoxLayout(record_group)
@@ -434,6 +490,8 @@ class MainWindow(QMainWindow):
             "torque_target",
             "angle_target",
             "velocity_target",
+            "openloop_m1_cmd",
+            "openloop_m2_cmd",
             "stage",
         ]:
             label = QLabel("-")
@@ -444,6 +502,7 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(status_group)
         control_layout.addWidget(commands_group)
         control_layout.addWidget(custom_group)
+        control_layout.addWidget(manual_group)
         control_layout.addWidget(record_group)
         control_layout.addWidget(metrics_group)
 
@@ -463,6 +522,88 @@ class MainWindow(QMainWindow):
         self.send_button.clicked.connect(self._send_custom_command)
         self.record_button.clicked.connect(self._start_recording)
         self.stop_record_button.clicked.connect(self._stop_recording)
+        self._update_direction_summary()
+
+    def _build_manual_verification_group(self) -> QGroupBox:
+        group = QGroupBox("单电机手动控制 / 方向确认")
+        layout = QGridLayout(group)
+
+        layout.addWidget(QLabel("动作"), 0, 0)
+        layout.addWidget(QLabel("执行"), 0, 1)
+        layout.addWidget(QLabel("判定"), 0, 2)
+
+        direction_keys = [
+            "manual_check_m1f",
+            "manual_check_m1r",
+            "manual_check_m2f",
+            "manual_check_m2r",
+        ]
+        for row, key in enumerate(direction_keys, start=1):
+            title = self.direction_check_titles[key]
+            command = self.direction_check_commands[key]
+            layout.addWidget(QLabel(title), row, 0)
+
+            action_button = QPushButton("执行")
+            action_button.clicked.connect(lambda _checked=False, cmd=command: self._send_manual_verification_command(cmd))
+            layout.addWidget(action_button, row, 1)
+
+            combo = QComboBox()
+            combo.addItems(["未测", "正确", "错误"])
+            combo.currentTextChanged.connect(lambda _text, state_key=key: self._update_direction_summary())
+            layout.addWidget(combo, row, 2)
+            self.direction_check_combos[key] = combo
+
+        stop_specs = [
+            ("M1 停止", "M1S"),
+            ("M2 停止", "M2S"),
+            ("全部停止", "MS"),
+        ]
+        for index, (title, command) in enumerate(stop_specs):
+            button = QPushButton(title)
+            button.clicked.connect(lambda _checked=False, cmd=command: self._send_manual_verification_command(cmd))
+            layout.addWidget(button, 5, index)
+
+        reset_button = QPushButton("清空判定")
+        reset_button.clicked.connect(self._reset_direction_checks)
+        layout.addWidget(reset_button, 6, 0)
+
+        layout.addWidget(QLabel("最近手动命令"), 6, 1)
+        layout.addWidget(self.last_manual_command_label, 6, 2)
+        layout.addWidget(QLabel("方向确认结果"), 7, 0)
+        layout.addWidget(self.manual_summary_label, 7, 1, 1, 2)
+
+        return group
+
+    def _send_manual_verification_command(self, command: str) -> None:
+        if self._send_command(command):
+            self.last_manual_command_label.setText(command)
+
+    def _reset_direction_checks(self) -> None:
+        for combo in self.direction_check_combos.values():
+            combo.setCurrentText("未测")
+        self.last_manual_command_label.setText("-")
+        self._update_direction_summary()
+
+    def _update_direction_summary(self) -> None:
+        states = [combo.currentText() for combo in self.direction_check_combos.values()]
+        correct = sum(1 for state in states if state == "正确")
+        failed = sum(1 for state in states if state == "错误")
+        untested = sum(1 for state in states if state == "未测")
+
+        if failed > 0:
+            summary = f"FAIL（正确 {correct}/4，错误 {failed}，未测 {untested}）"
+        elif correct == len(states) and states:
+            summary = "PASS（4/4 方向确认正确）"
+        else:
+            summary = f"进行中（正确 {correct}/4，未测 {untested}）"
+
+        self.manual_summary_label.setText(summary)
+
+    def _get_direction_check_snapshot(self) -> dict[str, str]:
+        snapshot = {key: combo.currentText() for key, combo in self.direction_check_combos.items()}
+        snapshot["manual_check_summary"] = self.manual_summary_label.text()
+        snapshot["last_manual_command"] = self.last_manual_command_label.text()
+        return snapshot
 
     def _build_overview_tab(self) -> QWidget:
         page = QWidget()
@@ -480,6 +621,8 @@ class MainWindow(QMainWindow):
         self.curves["m1_velocity"] = self.motor_velocity_plot.plot(pen=pg.mkPen("#16a085", width=2), name="M1 Vel")
         self.curves["m2_velocity"] = self.motor_velocity_plot.plot(pen=pg.mkPen("#c0392b", width=2), name="M2 Vel")
         self.curves["velocity_target"] = self.motor_velocity_plot.plot(pen=pg.mkPen("#7f8c8d", width=2, style=Qt.PenStyle.DashLine), name="Vel Target")
+        self.curves["openloop_m1_cmd"] = self.motor_velocity_plot.plot(pen=pg.mkPen("#00d2d3", width=2), name="OpenLoop M1")
+        self.curves["openloop_m2_cmd"] = self.motor_velocity_plot.plot(pen=pg.mkPen("#ff9f43", width=2), name="OpenLoop M2")
 
         layout.addWidget(self.battery_plot)
         layout.addWidget(self.imu_angle_plot)
@@ -579,12 +722,13 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "串口错误", message)
         self.connect_button.setText("连接串口")
 
-    def _send_command(self, command: str) -> None:
+    def _send_command(self, command: str) -> bool:
         if not self.worker or not self.worker.isRunning():
             QMessageBox.information(self, "尚未连接", "请先连接串口再发送命令。")
-            return
-        self.worker.write_text(command)
+            return False
+        self.worker.write_text(f"{command}\n")
         self.statusBar().showMessage(f"已发送命令: {command}", 2000)
+        return True
 
     def _send_custom_command(self) -> None:
         text = self.send_input.text().strip()
@@ -685,6 +829,7 @@ class MainWindow(QMainWindow):
         row["msg_type"] = event.kind
         row["current_test"] = self.current_test
         row["raw_line"] = event.raw_line
+        row.update(self._get_direction_check_snapshot())
         for key, value in event.values.items():
             if key in row:
                 row[key] = value

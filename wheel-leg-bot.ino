@@ -31,10 +31,22 @@ MagneticSensorI2C sensor2 = MagneticSensorI2C(AS5600_I2C);
 int current_test = 0;
 unsigned long last_print_time = 0;
 bool sensors_initialized = false;
+bool drivers_initialized = false;
 bool motors_initialized = false;
 bool foc_ready = false;
 float battery_filtered = 0.0f;
 int motor_test_stage = 0;
+String serial_command_buffer;
+unsigned long last_serial_input_time = 0;
+float manual_openloop_speed = 4.0f;
+
+enum MotorInitMode {
+    MOTOR_MODE_NONE = 0,
+    MOTOR_MODE_OPEN_LOOP,
+    MOTOR_MODE_CLOSED_LOOP,
+};
+
+MotorInitMode motor_mode = MOTOR_MODE_NONE;
 
 void printMenu() {
   Serial.println("\n===============================");
@@ -51,6 +63,9 @@ void printMenu() {
   Serial.println(" 7: Motors Position Closed-loop (angle)");
   Serial.println(" 8: Motors Speed Closed-loop (velocity)");
   Serial.println(" 9: Motors Torque Sweep (M1/M2 independent)");
+    Serial.println("10: Motors Open-loop Spin (NO encoder required)");
+    Serial.println("11: Motors Manual Open-loop Mode");
+    Serial.println("    Manual commands: M1F M1R M1S M2F M2R M2S MS");
 }
 
 void initSensors() {
@@ -82,6 +97,26 @@ void configureVelocityMode() {
     motor2.controller = MotionControlType::velocity;
 }
 
+void configureOpenLoopMode() {
+    motor1.torque_controller = TorqueControlType::voltage;
+    motor2.torque_controller = TorqueControlType::voltage;
+    motor1.controller = MotionControlType::velocity_openloop;
+    motor2.controller = MotionControlType::velocity_openloop;
+}
+
+void initDrivers() {
+    if (drivers_initialized) return;
+
+    driver1.voltage_power_supply = 8;
+    driver2.voltage_power_supply = 8;
+    driver1.init();
+    driver2.init();
+    motor1.linkDriver(&driver1);
+    motor2.linkDriver(&driver2);
+
+    drivers_initialized = true;
+}
+
 bool runFOCCalibration() {
     if (!motors_initialized) {
         Serial.println("Motor hardware is not initialized.");
@@ -98,18 +133,17 @@ bool runFOCCalibration() {
 
 void initMotors() {
     if(motors_initialized) return;
+    if (motor_mode == MOTOR_MODE_OPEN_LOOP) {
+        Serial.println("Motors already initialized in open-loop mode. Please reboot before switching to closed-loop tests.");
+        return;
+    }
     Serial.println("Initializing Motors & Encoders...");
     initSensors();
 
     motor1.linkSensor(&sensor1);
     motor2.linkSensor(&sensor2);
 
-    driver1.voltage_power_supply = 8;
-    driver2.voltage_power_supply = 8;
-    driver1.init();
-    driver2.init();
-    motor1.linkDriver(&driver1);
-    motor2.linkDriver(&driver2);
+    initDrivers();
 
     // Initial safe voltage and limits
     motor1.voltage_sensor_align = 6;
@@ -135,16 +169,121 @@ void initMotors() {
     motor2.init();
 
     motors_initialized = true;
+    motor_mode = MOTOR_MODE_CLOSED_LOOP;
     Serial.println("Motors Initialized. Run test 6 to calibrate FOC.");
+}
+
+void initOpenLoopMotors() {
+    if (motor_mode == MOTOR_MODE_CLOSED_LOOP) {
+        Serial.println("Motors already initialized for closed-loop tests. Reboot board if you want pure open-loop mode.");
+        return;
+    }
+    if (motors_initialized && motor_mode == MOTOR_MODE_OPEN_LOOP) {
+        return;
+    }
+
+    Serial.println("Initializing motors in open-loop mode (encoder not required)...");
+    initDrivers();
+
+    motor1.voltage_limit = 2.0;
+    motor2.voltage_limit = 2.0;
+    motor1.velocity_limit = 25;
+    motor2.velocity_limit = 25;
+    configureOpenLoopMode();
+
+    motor1.init();
+    motor2.init();
+
+    motors_initialized = true;
+    motor_mode = MOTOR_MODE_OPEN_LOOP;
+    foc_ready = false;
+    Serial.println("Open-loop motors initialized successfully.");
 }
 
 void stopMotors() {
     if (!motors_initialized) return;
-    configureTorqueMode();
+    if (motor_mode == MOTOR_MODE_OPEN_LOOP) {
+        configureOpenLoopMode();
+    } else {
+        configureTorqueMode();
+    }
     motor1.target = 0;
     motor2.target = 0;
     motor1.move();
     motor2.move();
+}
+
+bool enterManualOpenLoopMode() {
+    if (current_test != 11) {
+        enterTest(11);
+    }
+    return motor_mode == MOTOR_MODE_OPEN_LOOP;
+}
+
+void printManualOpenLoopState(const char *tag = "Manual OpenLoop") {
+    Serial.printf("%s | M1 Cmd:%.2f | M2 Cmd:%.2f\n", tag, motor1.target, motor2.target);
+}
+
+void applyManualMotorCommand(const String &upper_cmd) {
+    if (!enterManualOpenLoopMode()) {
+        Serial.println("Manual open-loop mode is unavailable right now.");
+        return;
+    }
+
+    if (upper_cmd == "M1F") {
+        motor1.target = manual_openloop_speed;
+        motor2.target = 0.0f;
+    } else if (upper_cmd == "M1R") {
+        motor1.target = -manual_openloop_speed;
+        motor2.target = 0.0f;
+    } else if (upper_cmd == "M1S") {
+        motor1.target = 0.0f;
+    } else if (upper_cmd == "M2F") {
+        motor1.target = 0.0f;
+        motor2.target = manual_openloop_speed;
+    } else if (upper_cmd == "M2R") {
+        motor1.target = 0.0f;
+        motor2.target = -manual_openloop_speed;
+    } else if (upper_cmd == "M2S") {
+        motor2.target = 0.0f;
+    } else if (upper_cmd == "MS") {
+        motor1.target = 0.0f;
+        motor2.target = 0.0f;
+    }
+
+    motor1.move();
+    motor2.move();
+    printManualOpenLoopState("Manual Command Applied OpenLoop");
+}
+
+void processSerialCommand(const String &command) {
+    String cmd = command;
+    cmd.trim();
+    if (cmd.length() == 0) return;
+
+    String upper_cmd = cmd;
+    upper_cmd.toUpperCase();
+
+    if (cmd.equalsIgnoreCase("h")) {
+        printMenu();
+        return;
+    }
+
+    if (upper_cmd == "M1F" || upper_cmd == "M1R" || upper_cmd == "M1S" ||
+        upper_cmd == "M2F" || upper_cmd == "M2R" || upper_cmd == "M2S" ||
+        upper_cmd == "MS") {
+        applyManualMotorCommand(upper_cmd);
+        return;
+    }
+
+    int test_id = cmd.toInt();
+    if (cmd == "0" || (test_id >= 1 && test_id <= 11)) {
+        enterTest(test_id);
+    } else {
+        Serial.print("Unknown command: ");
+        Serial.println(cmd);
+        Serial.println("Use 0-11, h, or M1F/M1R/M1S/M2F/M2R/M2S/MS.");
+    }
 }
 
 void enterTest(int test_id) {
@@ -197,6 +336,13 @@ void enterTest(int test_id) {
         if (!foc_ready) runFOCCalibration();
         configureTorqueMode();
         Serial.println("Torque sweep test started (M1/M2 independent stages)." );
+    } else if (current_test == 10) {
+        initOpenLoopMotors();
+        Serial.println("Open-loop spin test started. Encoder is NOT required for this mode.");
+    } else if (current_test == 11) {
+        initOpenLoopMotors();
+        stopMotors();
+        Serial.println("Manual open-loop mode started. Use M1F/M1R/M1S/M2F/M2R/M2S/MS.");
     }
 }
 
@@ -221,13 +367,23 @@ void setup() {
 }
 
 void loop() {
-  if (Serial.available()) {
-    char c = Serial.read();
-        if (c == 'h' || c == 'H') {
-            printMenu();
-        } else if (c >= '0' && c <= '9') {
-            enterTest(c - '0');
+    while (Serial.available()) {
+        char c = Serial.read();
+        last_serial_input_time = millis();
+
+        if (c == '\r' || c == '\n') {
+            processSerialCommand(serial_command_buffer);
+            serial_command_buffer = "";
+        } else if (c == ' ' || c == '\t') {
+            continue;
+        } else {
+            serial_command_buffer += c;
+        }
     }
+
+    if (serial_command_buffer.length() > 0 && millis() - last_serial_input_time > 120) {
+        processSerialCommand(serial_command_buffer);
+        serial_command_buffer = "";
   }
 
   // --- Test 1: Battery ---
@@ -372,6 +528,43 @@ void loop() {
           last_print_time = millis();
           Serial.printf("Stage:%d | M1 Target:%.2f Vel:%.2f | M2 Target:%.2f Vel:%.2f\n",
                         motor_test_stage, motor1.target, motor1.shaft_velocity, motor2.target, motor2.shaft_velocity);
+      }
+  }
+  // --- Test 10: Open-loop Motor Spin ---
+  else if (current_test == 10) {
+      if (motor_mode != MOTOR_MODE_OPEN_LOOP) return;
+
+      unsigned long sec = millis() / 1000;
+      motor_test_stage = sec % 4;
+      if (motor_test_stage == 0) {
+          motor1.target = 4.0f; motor2.target = 0.0f;
+      } else if (motor_test_stage == 1) {
+          motor1.target = -4.0f; motor2.target = 0.0f;
+      } else if (motor_test_stage == 2) {
+          motor1.target = 0.0f; motor2.target = 4.0f;
+      } else {
+          motor1.target = 0.0f; motor2.target = -4.0f;
+      }
+
+      motor1.move();
+      motor2.move();
+
+      if (millis() - last_print_time > 500) {
+          last_print_time = millis();
+          Serial.printf("OpenLoop Stage:%d | M1 Cmd:%.2f | M2 Cmd:%.2f\n",
+                        motor_test_stage, motor1.target, motor2.target);
+      }
+  }
+  // --- Test 11: Manual Open-loop Motor Control ---
+  else if (current_test == 11) {
+      if (motor_mode != MOTOR_MODE_OPEN_LOOP) return;
+
+      motor1.move();
+      motor2.move();
+
+      if (millis() - last_print_time > 500) {
+          last_print_time = millis();
+          printManualOpenLoopState();
       }
   }
 }
