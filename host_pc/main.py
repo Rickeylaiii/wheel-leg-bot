@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -355,7 +356,15 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("轮腿机器人测试上位机")
-        self.resize(1480, 920)
+        # 自适应屏幕分辨率：取可用区域的 92%，不超过 1600×1000
+        _screen = QApplication.primaryScreen()
+        _avail = _screen.availableGeometry() if _screen else None  # type: ignore[union-attr]
+        if _avail is not None:
+            w = min(int(_avail.width() * 0.92), 1600)
+            h = min(int(_avail.height() * 0.92), 1000)
+        else:
+            w, h = 1280, 800
+        self.resize(w, h)
 
         self.parser = TelemetryParser()
         self.worker: Optional[SerialWorker] = None
@@ -413,9 +422,12 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter)
 
+        # 内容容器（放进滚动区）
         control_panel = QWidget()
         control_layout = QVBoxLayout(control_panel)
         control_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        control_layout.setContentsMargins(4, 4, 4, 4)
+        control_layout.setSpacing(4)
 
         serial_group = QGroupBox("串口")
         serial_form = QFormLayout(serial_group)
@@ -506,16 +518,28 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(record_group)
         control_layout.addWidget(metrics_group)
 
+        # 将控制面板放入滚动区，避免小屏幕被截断
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(control_panel)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setMinimumWidth(300)
+        scroll_area.setMaximumWidth(400)
+
         plots_tabs = QTabWidget()
         plots_tabs.addTab(self._build_overview_tab(), "实时曲线")
         plots_tabs.addTab(self._build_detail_tab(), "细节曲线")
         plots_tabs.addTab(self._build_raw_log_tab(), "原始日志")
 
-        splitter.addWidget(control_panel)
+        splitter.addWidget(scroll_area)
         splitter.addWidget(plots_tabs)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 1120])
+        # 按当前窗口宽度的 25% 分配左侧面板
+        total = self.width() if self.width() > 100 else 1280
+        left_w = min(340, int(total * 0.25))
+        splitter.setSizes([left_w, total - left_w])
 
         self.refresh_button.clicked.connect(self._refresh_ports)
         self.connect_button.clicked.connect(self._toggle_connection)
